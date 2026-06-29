@@ -4,8 +4,10 @@ import json
 import os
 from collections import defaultdict
 from difflib import SequenceMatcher
+from datetime import datetime
 
 ARQUIVO_MEMORIA = "memoria.json"
+ARQUIVO_HISTORICO = "historico_transacoes.json"
 
 # =========================
 # 🧠 MEMÓRIA
@@ -20,6 +22,40 @@ def salvar_memoria(memoria):
     with open(ARQUIVO_MEMORIA, "w", encoding="utf-8") as f:
         json.dump(memoria, f, indent=2, ensure_ascii=False)
 
+# =========================
+# 📚 HISTÓRICO DE TRANSAÇÕES
+# =========================
+def carregar_historico(caminho_historico):
+    if not os.path.exists(caminho_historico):
+        return set()
+
+    with open(caminho_historico, "r", encoding="utf-8") as f:
+        return set(json.load(f))
+
+
+def salvar_historico(historico, caminho_historico):
+    with open(caminho_historico, "w", encoding="utf-8") as f:
+        json.dump(
+            sorted(list(historico)),
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+
+def gerar_chave_transacao(t):
+    descricao = re.sub(r"\s+", " ", t["descricao"].strip().lower())
+
+    parcelamento = ""
+    if pd.notna(t["parcelamento"]):
+        parcelamento = str(t["parcelamento"]).strip().lower()
+
+    return (
+        f"{t['data']}|"
+        f"{descricao}|"
+        f"{parcelamento}|"
+        f"{t['valor']:.2f}"
+    )
 
 # =========================
 # 🧠 SIMILARIDADE
@@ -234,27 +270,71 @@ if __name__ == "__main__":
     diretorio_final = os.path.join(diretorio_base, ano, mes)
     os.makedirs(diretorio_final, exist_ok=True)
 
-
     # Caminhos finais
-    caminho_excel = os.path.join(diretorio_final, f"{nome_base}.xlsx")
+    caminho_excel = os.path.join(diretorio_final, f"categorizado_{datetime.now().strftime("%d.%m.%Y_%H:%M:%S")}.xlsx")
+    caminho_historico = os.path.join(diretorio_final, ARQUIVO_HISTORICO)
 
     memoria = carregar_memoria()
+    historico = carregar_historico(caminho_historico)
 
-    # 1. Ler transações do excel
+    # =========================
+    # LER FATURA
+    # =========================
     transacoes = ler_transacoes_excel(arquivo_entrada)
+
     print(f"✅ {len(transacoes)} transações encontradas")
 
-    # 2. Classificar com apredizado
-    for t in transacoes:
-        t['categoria'] = classificar(t['descricao'], t['parcelamento'], t['valor'], memoria)
+    # =========================
+    # REMOVER DUPLICADAS
+    # =========================
+    novas_transacoes = []
 
-    # 3. Salvar excel
-    salvar_excel (transacoes, caminho_excel)
+    for t in transacoes:
+        chave = gerar_chave_transacao(t)
+
+        if chave not in historico:
+            t["_chave"] = chave
+            novas_transacoes.append(t)
+
+    print(f"🆕 {len(novas_transacoes)} novas transações")
+
+    if not novas_transacoes:
+        print("\n✅ Nenhuma nova transação encontrada.")
+        exit()
+
+    # =========================
+    # CLASSIFICAR
+    # =========================
+    for t in novas_transacoes:
+        t["categoria"] = classificar(
+            t["descricao"],
+            t["parcelamento"],
+            t["valor"],
+            memoria
+        )
+
+    # =========================
+    # ATUALIZAR HISTÓRICO
+    # =========================
+    for t in novas_transacoes:
+        historico.add(t["_chave"])
+        del t["_chave"]
+
+    salvar_historico(historico, caminho_historico)
+
+    # =========================
+    # GERAR EXCEL
+    # =========================
+    salvar_excel(novas_transacoes, caminho_excel)
+
     print(f"\n💾 Excel salvo em: {caminho_excel}")
 
-    # 4. Resumo
+    # =========================
+    # RESUMO
+    # =========================
     print("\n📊 RESUMO POR CATEGORIA:")
-    resumo, total_geral = resumo_por_categoria(transacoes)
+
+    resumo, total_geral = resumo_por_categoria(novas_transacoes)
 
     for categoria, valor in sorted(resumo.items(), key=lambda x: x[1], reverse=True):
         percentual = (valor / total_geral) * 100 if total_geral > 0 else 0
