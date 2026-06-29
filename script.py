@@ -1,6 +1,5 @@
-from pypdf import PdfReader, PdfWriter
+import pandas as pd
 import re
-import csv
 import json
 import os
 from collections import defaultdict
@@ -28,48 +27,87 @@ def salvar_memoria(memoria):
 def parecido(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
+#==========================
+# MESES EM PORTUGUES
+#==========================
+MESES_PT =  {
+    'janeiro': '01', 'fevereiro': '02', 'marco': '03', 'março': '03',
+    'abril': '04', 'maio': '05', 'junho': '06', 'julho': '07',
+    'agosto': '08', 'setembro': '09', 'outubro': '10',
+    'novembro': '11', 'dezembro': '12'
+}
 
 # =========================
-# DESBLOQUEAR PDF
+# EXTRAIR MÊS/ANO DO NOME
 # =========================
-def desbloquear_pdf(caminho_entrada, caminho_saida, senha):
-    try:
-        reader = PdfReader(caminho_entrada)
+def extrair_mes_ano(nome_base): 
+    #Tenta padrão DD-YYYY (ex: 07-2026)
+    m = re.search(r'(\d{2})-(\d{4})', nome_base)
+    if m:
+        return m.group(1), m.group(2)
+    
+    # Tenta nome do mês em português + ano (ex: junho2026)
+    nome_lower = nome_base.lower()
+    for nome_mes, num_mes in MESES_PT.items():
+        m = re.search(
+            rf'({re.escape(nome_mes)})(\d{{4}})',
+            nome_lower,
+            re.IGNORECASE
+        )
+        if m:
+            return num_mes, m.group(2)
 
-        if reader.is_encrypted:
-            reader.decrypt(senha)
-
-        writer = PdfWriter()
-
-        for pagina in reader.pages:
-            writer.add_page(pagina)
-
-        with open(caminho_saida, "wb") as f:
-            writer.write(f)
-
-        return True
-    except:
-        return False
-
+    raise ValueError('Não foi possível extrair mês/ano do nome do arquivo')
 
 # =========================
-# EXTRAIR TEXTO
+# LER TRANSAÇÕES DO EXCEL
 # =========================
-def extrair_texto_pdf(caminho):
-    reader = PdfReader(caminho)
-    texto = ""
+def ler_transacoes_excel(caminho):
+    df_raw = pd.read_excel(caminho, header=None)
 
-    for pagina in reader.pages:
-        texto += pagina.extract_text() + "\n"
+    #Encontra a linha do cabeçalho (contém 'Data' e 'Lançamento')
+    header_row = None
+    for i, row in df_raw.iterrows():
+        valores = row.values.tolist()
+        if 'Data' in valores and 'Lançamento' in valores:
+            header_row = i
+            break
 
-    return texto
+    if header_row is None:
+        raise ValueError("Cabeçalho 'Data'/'Lançamento' não encontrado no Excel")
+    
+    df = pd.read_excel(caminho, header=header_row)
 
+    #Filtra apenas as colunas necessárias
+    df = df[['Data', 'Lançamento','Parcelamento', 'Valor']].copy()
 
+    #Remove linhas sem data, sem valor (linhas de subtotal, rodapé, etc...)
+    df = df.dropna(subset=['Data', 'Valor'])
+    df = df[df['Lançamento'].notna()]
+
+    df= df[df['Valor'] > 0]
+
+    transacoes = []
+    for _, row in df.iterrows():
+        data = pd.to_datetime(row['Data']).strftime('%d/%m/%Y')
+        lancamento = str(row['Lançamento']).strip()
+        parcelamento = row['Parcelamento']
+        valor = float(row['Valor'])
+
+        transacoes.append({
+            'data': data,
+            'descricao': lancamento,
+            'parcelamento': parcelamento,
+            'valor': valor,
+            'categoria': None
+        })
+
+    return transacoes
 
 # =========================
 # 🤖 CLASSIFICADOR INTELIGENTE + TREINO
 # =========================
-def classificar(descricao, memoria):
+def classificar(descricao, parcelamento, valor, memoria):
     d = descricao.lower()
 
     # 1️⃣ match exato
@@ -97,8 +135,12 @@ def classificar(descricao, memoria):
     # 4️⃣ regra base
     categoria = classificar_base(descricao)
 
+    #Combina lançamento + parcelamento na descrição
+    if pd.notna(parcelamento) and str(parcelamento).strip():
+        descricao = f"{descricao} - {str(parcelamento).strip()}"
+
     # 🔥 5️⃣ TREINO AUTOMÁTICO (APRENDIZADO)
-    print(f"\n🔎 {descricao}")
+    print(f"\n🔎 {descricao} - R${valor:.2f}")
     print(f"👉 Sugestão: {categoria}")
 
     resp = input("Está correto? (Enter=sim / digite nova categoria): ").strip()
@@ -119,7 +161,7 @@ def classificar(descricao, memoria):
 def classificar_base(descricao):
     d = descricao.lower()
 
-    if any(x in d for x in ["ifood", "food", "burger", "pizza", "lanch"]):
+    if any(x in d for x in ["ifood", "food", "burger", "pizza", "lanch", "ifd"]):
         return "Alimentação"
 
     elif "99food" in d:
@@ -143,57 +185,21 @@ def classificar_base(descricao):
     else:
         return "Outros"
 
-# =========================
-# EXTRAIR TRANSAÇÕES
-# =========================
-def extrair_transacoes(texto):
-    linhas = texto.split("\n")
-    transacoes = []
-
-    capturando = False
-    padrao = re.compile(r"^(\d{2}/\d{2})\s+(.+?)\s+(\d+,\d{2})$")
-
-    for linha in linhas:
-        linha = linha.strip()
-
-        if "Continua..." in linha:
-            capturando = True
-            continue
-
-        if "ENVIO MENS.AUTOMATICA" in linha:
-            break
-
-        if not capturando:
-            continue
-
-        match = padrao.match(linha)
-
-        if match:
-            data, descricao, valor = match.groups()
-            valor = float(valor.replace(",", "."))
-
-            transacoes.append({
-                "data": data,
-                "descricao": descricao,
-                "valor": valor,
-                "categoria": None
-            })
-
-    return transacoes
-
 
 # =========================
-# SALVAR CSV
+# SALVAR EXCEL
 # =========================
-def salvar_csv(transacoes, caminho):
-    with open(caminho, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["data", "descricao", "valor", "categoria"]
-        )
-        writer.writeheader()
-        writer.writerows(transacoes)
+def salvar_excel(transacoes, caminho):
+    rows = [{
+        'Data': t['data'],
+        'Descrição': t['descricao'],
+        'Valor': t['valor'],
+        'Conta': 'Pessoal',
+        'Categoria': t['categoria']
+    } for t in transacoes]
 
+    df = pd.DataFrame(rows)
+    df.to_excel(caminho, index=False)
 
 # =========================
 # RESUMO
@@ -213,58 +219,40 @@ def resumo_por_categoria(transacoes):
 # MAIN
 # =========================
 if __name__ == "__main__":
-    arquivo_entrada = "C:\\faturas\\Fatura_07-2026.pdf"
-    senha = "45086"
+    arquivo_entrada = input("Informe o caminho da planilha excel: ")
 
     # Nome base
     nome_base = os.path.splitext(os.path.basename(arquivo_entrada))[0]
 
     # Extrair mês e ano com regex
-    match = re.search(r"(\d{2})-(\d{4})", nome_base)
-
-    if match:
-        mes, ano = match.groups()
-    else:
-        raise ValueError("Não foi possível extrair mês/ano do nome do arquivo")
+    mes, ano = extrair_mes_ano(nome_base)
 
     # Diretório base
     diretorio_base = os.path.dirname(arquivo_entrada)
 
     # Criar estrutura: /ano/mes
     diretorio_final = os.path.join(diretorio_base, ano, mes)
-
-    # Criar pasta se não existir
     os.makedirs(diretorio_final, exist_ok=True)
 
+
     # Caminhos finais
-    arquivo_saida = os.path.join(diretorio_final, f"{nome_base}_desbloqueada.pdf")
-    caminho_txt = os.path.join(diretorio_final, f"{nome_base}.txt")
-    caminho_csv = os.path.join(diretorio_final, f"{nome_base}.csv")
+    caminho_excel = os.path.join(diretorio_final, f"{nome_base}.xlsx")
 
     memoria = carregar_memoria()
 
-    # 1. Desbloquear
-    if not desbloquear_pdf(arquivo_entrada, arquivo_saida, senha):
-        print("❌ Erro ao desbloquear PDF")
-        exit()
+    # 1. Ler transações do excel
+    transacoes = ler_transacoes_excel(arquivo_entrada)
+    print(f"✅ {len(transacoes)} transações encontradas")
 
-    # 2. Extrair texto
-    texto = extrair_texto_pdf(arquivo_saida)
-
-    with open(caminho_txt, "w", encoding="utf-8") as f:
-        f.write(texto)
-
-    # 3. Extrair transações
-    transacoes = extrair_transacoes(texto)
-
-    # 4. Classificar com aprendizado
+    # 2. Classificar com apredizado
     for t in transacoes:
-        t["categoria"] = classificar(t["descricao"], memoria)
+        t['categoria'] = classificar(t['descricao'], t['parcelamento'], t['valor'], memoria)
 
-    # 5. Salvar CSV
-    salvar_csv(transacoes, caminho_csv)
+    # 3. Salvar excel
+    salvar_excel (transacoes, caminho_excel)
+    print(f"\n💾 Excel salvo em: {caminho_excel}")
 
-    # 6. Resumo
+    # 4. Resumo
     print("\n📊 RESUMO POR CATEGORIA:")
     resumo, total_geral = resumo_por_categoria(transacoes)
 
